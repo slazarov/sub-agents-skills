@@ -3,7 +3,7 @@
 run_subagent.py - Execute external CLI AIs as sub-agents
 
 Usage:
-    scripts/run_subagent.py --agent <name> --prompt "..." --cwd <path>
+    scripts/run_subagent.py --agent <name> --prompt "<task>" --cwd <path>
     scripts/run_subagent.py --list
 
 Supported CLIs: claude, cursor-agent, codex, gemini
@@ -22,7 +22,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 # =============================================================================
 # Agent Loader - frontmatter parsing and system context extraction
 # =============================================================================
@@ -35,6 +34,7 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
     """
     pattern = r"^---\s*\n(.*?)\n---\s*\n(.*)$"
     match = re.match(pattern, content, re.DOTALL)
+
     if not match:
         return {}, content
 
@@ -74,10 +74,10 @@ def validate_agent_name(agent_name: str) -> str:
     return agent_name
 
 
-def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str]:
+def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str | None, str, str]:
     """
-    Load agent definition file and extract run-agent setting.
-    Returns (run_agent_cli, system_context, description)
+    Load agent definition file and extract run-agent and model settings.
+    Returns (run_agent_cli, model, system_context, description)
     """
     validate_agent_name(agent_name)
     agents_path = Path(agents_dir)
@@ -85,18 +85,19 @@ def load_agent(agents_dir: str, agent_name: str) -> tuple[str | None, str, str]:
     # Try .md first, then .txt
     for ext in [".md", ".txt"]:
         agent_file = agents_path / f"{agent_name}{ext}"
-
         # Defense in depth: verify resolved path stays within agents_dir
         resolved = agent_file.resolve()
         if not str(resolved).startswith(str(agents_path.resolve())):
             raise ValueError(f"Invalid agent name: {agent_name!r}")
-
         if resolved.exists():
             content = resolved.read_text(encoding="utf-8")
             frontmatter, body = parse_frontmatter(content)
+
             run_agent = frontmatter.get("run-agent")
+            model = frontmatter.get("model")
             description = extract_description(body)
-            return run_agent, body.strip(), description
+
+            return run_agent, model, body.strip(), description
 
     raise FileNotFoundError(f"Agent definition not found: {agent_name}")
 
@@ -116,7 +117,6 @@ def list_agents(agents_dir: str) -> list[dict]:
     for ext in [".md", ".txt"]:
         for agent_file in agents_path.glob(f"*{ext}"):
             name = agent_file.stem
-
             # Skip if already added (prefer .md over .txt)
             if name in seen_names:
                 continue
@@ -179,14 +179,14 @@ def detect_caller_cli() -> str | None:
         if os.path.exists(cmdline_path):
             with open(cmdline_path) as f:
                 cmdline = f.read().lower()
-            if "claude" in cmdline:
-                return "claude"
-            if "cursor" in cmdline:
-                return "cursor-agent"
-            if "codex" in cmdline:
-                return "codex"
-            if "gemini" in cmdline:
-                return "gemini"
+                if "claude" in cmdline:
+                    return "claude"
+                if "cursor" in cmdline:
+                    return "cursor-agent"
+                if "codex" in cmdline:
+                    return "codex"
+                if "gemini" in cmdline:
+                    return "gemini"
     except Exception:
         pass
 
@@ -300,13 +300,18 @@ class StreamProcessor:
 # =============================================================================
 
 
-def build_command(cli: str, prompt: str) -> tuple[str, list]:
+def build_command(cli: str, prompt: str, model: str | None = None) -> tuple[str, list]:
     """Build command and arguments for the specified CLI."""
+
     if cli == "codex":
         return "codex", ["exec", "--json", prompt]
 
     if cli == "claude":
-        return "claude-zhipu", ["--output-format", "stream-json", "--verbose", "-p", prompt]
+        args = ["--output-format", "stream-json", "--verbose"]
+        if model:
+            args.extend(["--model", model])
+        args.extend(["-p", prompt])
+        return "claude", args
 
     if cli == "gemini":
         return "gemini", ["--output-format", "stream-json", "-p", prompt]
@@ -322,10 +327,12 @@ def build_command(cli: str, prompt: str) -> tuple[str, list]:
 
 
 def execute_agent(
-    cli: str, system_context: str, prompt: str, cwd: str, timeout: int = 600000
+    cli: str, system_context: str, prompt: str, cwd: str, timeout: int = 600000,
+    model: str | None = None,
 ) -> dict:
     """
     Execute agent CLI and return result.
+
     Returns: {
         "result": str,
         "exit_code": int,
@@ -336,7 +343,7 @@ def execute_agent(
     # Format prompt with system context
     formatted_prompt = f"[System Context]\n{system_context}\n\n[User Prompt]\n{prompt}"
 
-    command, args = build_command(cli, formatted_prompt)
+    command, args = build_command(cli, formatted_prompt, model=model)
     timeout_sec = timeout / 1000
 
     try:
@@ -393,13 +400,11 @@ def execute_agent(
                 "status": status,
                 "cli": cli,
             }
-
             if status == "error":
                 error_msg = f"CLI exited with code {exit_code}"
                 if stderr and stderr.strip():
                     error_msg += f": {stderr.strip()}"
                 response["error"] = error_msg
-
             return response
 
         except Exception as e:
@@ -422,13 +427,7 @@ def execute_agent(
             "error": f"CLI not found: {command}",
         }
     except Exception as e:
-        return {
-            "result": "",
-            "exit_code": 1,
-            "status": "error",
-            "cli": cli,
-            "error": str(e),
-        }
+        return {"result": "", "exit_code": 1, "status": "error", "cli": cli, "error": str(e)}
 
 
 # =============================================================================
@@ -447,6 +446,8 @@ def main():
         "--timeout", type=int, default=600000, help="Timeout in ms (default: 600000)"
     )
     parser.add_argument("--cli", help="Force specific CLI (claude, cursor-agent, codex, gemini)")
+    parser.add_argument("--model", help="Model to use (e.g. claude-opus-4-6, sonnet)")
+
     args = parser.parse_args()
 
     # Handle --list
@@ -513,13 +514,16 @@ def main():
 
     # Load agent definition
     try:
-        run_agent_cli, system_context, _ = load_agent(agents_dir, args.agent)
+        run_agent_cli, frontmatter_model, system_context, _ = load_agent(agents_dir, args.agent)
     except FileNotFoundError as e:
         print(json.dumps({"result": "", "exit_code": 1, "status": "error", "error": str(e)}))
         sys.exit(1)
 
     # Resolve CLI
     cli = args.cli or resolve_cli(run_agent_cli)
+
+    # Resolve model: CLI arg > frontmatter > None (CLI default)
+    model = args.model or frontmatter_model
 
     # Execute
     result = execute_agent(
@@ -528,6 +532,7 @@ def main():
         prompt=args.prompt,
         cwd=args.cwd,
         timeout=args.timeout,
+        model=model,
     )
 
     print(json.dumps(result, ensure_ascii=False))
